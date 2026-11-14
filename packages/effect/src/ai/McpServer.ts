@@ -39,6 +39,7 @@ import * as Predicate from "../Predicate.ts"
 import * as PubSub from "../PubSub.ts"
 import * as Queue from "../Queue.ts"
 import * as RcMap from "../RcMap.ts"
+import * as Redacted from "../Redacted.ts"
 import { CurrentLogLevel, Scheduler } from "../References.ts"
 import * as Result from "../Result.ts"
 import * as Rpc from "../rpc/Rpc.ts"
@@ -3228,7 +3229,93 @@ const getJsonRpcProtocolVersion = (message: unknown): string | undefined => {
   return Result.isSuccess(decoded) ? decoded.success.params.protocolVersion : undefined
 }
 
+/**
+ * The `_meta` key under which a toolkit tool's result identifies a declared
+ * failure.
+ *
+ * **Details**
+ *
+ * A declared failure is a tool error (`isError: true`) whose text is the
+ * failure's message, or its JSON encoding. The result's `_meta` also holds the
+ * failure under this key. A failure sent by its message, whose text is the
+ * message, carries its `_tag`, its message, and each of its declared fields
+ * whose encoded value is a JSON scalar (string, number, boolean or null), from
+ * a field whose schema is not redacted and not a defect, an error or
+ * `Schema.Unknown`. Nothing nested is sent, and redacted fields are left out.
+ * Each string is at most 1,024 characters and the whole value at most 4,096
+ * bytes of JSON. A failure that does not encode carries `{ _tag, message }`.
+ * Any other declared failure carries the JSON encoding of the tool's `failure`
+ * schema, the same value as its text. Undeclared failures and defects carry
+ * nothing here.
+ *
+ * @stability unstable
+ * @category constants
+ * @since 4.1.7
+ */
+export const FailureMeta = "website.effect/failure"
+
 const INTERNAL_TOOL_ERROR_MESSAGE = "Tool execution failed due to an internal server error."
+
+// The `_meta` of a failure sent by its message is bounded: each string, and
+// the whole value as JSON.
+const failureMetaMaxString = 1024
+const failureMetaMaxBytes = 4096
+
+// The declared fields of each tagged class in a tool's failure schema, by tag.
+const failureFieldsByTag = (ast: SchemaAST.AST): ReadonlyMap<string, ReadonlyArray<SchemaAST.PropertySignature>> => {
+  const fields = new Map<string, ReadonlyArray<SchemaAST.PropertySignature>>()
+  const visit = (node: SchemaAST.AST): void => {
+    if (node._tag === "Union") {
+      for (const member of node.types) visit(member)
+      return
+    }
+    const objects = node._tag === "Declaration" ? node.typeParameters[0] : node
+    if (objects?._tag !== "Objects") return
+    const tag = objects.propertySignatures.find((field) => field.name === "_tag")?.type
+    if (tag?._tag === "Literal" && typeof tag.literal === "string") fields.set(tag.literal, objects.propertySignatures)
+  }
+  visit(ast)
+  return fields
+}
+
+const isJsonScalar = (value: unknown): boolean =>
+  value === null || typeof value === "boolean" || typeof value === "string" ||
+  (typeof value === "number" && Number.isFinite(value))
+
+// What a failure sent by its message carries in `_meta`: its `_tag`, its
+// message, and each of its class's declared fields whose encoded value is a
+// JSON scalar, from a field that is not redacted and not a defect, an error
+// or `Schema.Unknown`. Nothing nested: a struct, an array or an inner error is
+// left out, and so is anything a field's schema does not declare. A failure
+// that does not encode carries `{ _tag, message }`.
+const failureMeta = (
+  error: Error,
+  tag: string,
+  encoded: Option.Option<unknown>,
+  fieldsByTag: ReadonlyMap<string, ReadonlyArray<SchemaAST.PropertySignature>>
+): Record<string, unknown> => {
+  const meta: Record<string, unknown> = {
+    _tag: tag,
+    message: error.message.length > failureMetaMaxString
+      ? error.message.slice(0, failureMetaMaxString)
+      : error.message
+  }
+  if (Option.isNone(encoded) || !Predicate.isObject(encoded.value)) return meta
+  const values = encoded.value as Record<string, unknown>
+  for (const field of fieldsByTag.get(tag) ?? []) {
+    const name = field.name
+    if (typeof name !== "string" || name === "_tag" || name === "message") continue
+    // `Schema.Unknown` and `Schema.Defect` declare `unknown`.
+    if (field.type._tag === "Unknown" || field.type._tag === "Any") continue
+    const value = (error as unknown as Record<string, unknown>)[name]
+    if (Redacted.isRedacted(value) || value instanceof Error) continue
+    const json = values[name]
+    if (!isJsonScalar(json) || (typeof json === "string" && json.length > failureMetaMaxString)) continue
+    meta[name] = json
+    if (JSON.stringify(meta).length > failureMetaMaxBytes) delete meta[name]
+  }
+  return meta
+}
 
 const toolErrorResult = (message: string): CallToolResult =>
   new CallToolResult({
@@ -3403,11 +3490,35 @@ export const registerToolkit: <Tools extends Record<string, Tool.Any>, Names ext
             description: cause.message
           })
         }))
+    // A declared failure is identified in the result's `_meta`, under
+    // `FailureMeta`, so a client can tell declared failures apart without
+    // parsing text. It is not `structuredContent`, which must match the tool's
+    // `outputSchema`. A failure sent by its message carries `failureMeta`; any
+    // other carries its JSON encoding, the same value as its text.
     const failureResult = (encoded: unknown) =>
-      new CallToolResult({ isError: true, content: toolResultContent(encoded) })
+      new CallToolResult({
+        isError: true,
+        content: toolResultContent(encoded),
+        ...(encoded === undefined ? {} : { _meta: { [FailureMeta]: encoded } })
+      })
+    const failureFields = failureFieldsByTag(tool.failureSchema.ast)
+    // A failure sent by its message: the text is the message, and `_meta`
+    // holds `failureMeta`, or `{ _tag, message }` when it does not encode.
+    const messageFailureResult = (error: Error, encoded: Option.Option<unknown>) =>
+      new CallToolResult({
+        isError: true,
+        content: [{ type: "text", text: error.message }],
+        ...(Predicate.hasProperty(error, "_tag") && typeof error._tag === "string"
+          ? { _meta: { [FailureMeta]: failureMeta(error, error._tag, encoded, failureFields) } }
+          : {})
+      })
     const declaredFailureResult = (error: unknown) =>
       error instanceof Error && error.message !== ""
-        ? Effect.succeed(toolErrorResult(error.message))
+        ? Effect.map(
+          // A failure or a defect while encoding: the failure carries `{ _tag, message }`.
+          Effect.exit(encodeFailure(error)),
+          (exit) => messageFailureResult(error, Exit.isSuccess(exit) ? Option.some(exit.value) : Option.none())
+        )
         : Effect.map(encodeFailure(error), failureResult)
     const successResult = (structuredContent: unknown) =>
       new CallToolResult({

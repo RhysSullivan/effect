@@ -254,9 +254,15 @@ other registrations and passed to the server.
 
 A tool result is sent to the client in its JSON encoding, the same encoding its advertised
 `outputSchema` describes. For example, a `Schema.Date` field is sent as an ISO string and a
-`Schema.Void` field as `null`. Declared failures are sent as text in the JSON encoding of their
-`failure` schema. In the default `"error"` failure mode, a declared `Error` with a non-empty
-`message` is sent as that message instead.
+`Schema.Void` field as `null`. Declared failures are sent as tool errors (`isError: true`) with
+text in the JSON encoding of their `failure` schema. In the default `"error"` failure mode, a
+declared `Error` with a non-empty `message` is sent as that message instead. The result's `_meta`
+identifies the failure under `McpServer.FailureMeta` (`"website.effect/failure"`). A failure sent by
+its message carries its `_tag`, its message, and each declared field whose encoded value is a JSON
+scalar, from a field that is not redacted and not a defect, an error or `Schema.Unknown`; nothing
+nested, at most 1,024 characters per string and 4,096 bytes in all. One that does not encode carries
+`{ _tag, message }`. Any other failure carries the same JSON encoding as its text. A failure is never
+sent as `structuredContent`, which clients check against the tool's `outputSchema`.
 
 In `tools/list`, an explicit `Tool.Destructive` value takes precedence. Otherwise,
 `destructiveHint` is `false` when `Tool.Readonly` is `true`, and `true` when `Tool.Readonly`
