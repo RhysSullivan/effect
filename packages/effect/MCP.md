@@ -262,6 +262,43 @@ In `tools/list`, an explicit `Tool.Destructive` value takes precedence. Otherwis
 `destructiveHint` is `false` when `Tool.Readonly` is `true`, and `true` when `Tool.Readonly`
 is `false` or unset.
 
+### Tools known per request
+
+`McpServer.addToolSource` adds tools that the server cannot know at startup, such as the tools of
+a remote MCP server reached with the caller's credentials. The source's `list` runs on every
+`tools/list`, and `call` receives calls of names that no registered tool has.
+
+```typescript
+import { Effect, Layer } from "effect"
+import { McpClient, McpSchema, McpServer } from "effect/ai"
+
+const Proxy = Layer.effectDiscard(Effect.gen(function*() {
+  const server = yield* McpServer.McpServer
+  const client = yield* McpClient.McpClient
+  yield* server.addToolSource({
+    list: client.listTools().pipe(Effect.orDie),
+    call: (name, args) =>
+      client.callTool({ tool: new McpSchema.Tool({ name, inputSchema: { type: "object" } }), arguments: args })
+        .pipe(Effect.orDie)
+  })
+}))
+```
+
+`list` returns the source's complete list; the server does not page it. Registered tools shadow
+listed tools of the same name. Add several sources with `owns`, which tells the server which names a
+source calls: a call goes to the first source whose `owns` accepts its name, and a source without
+`owns` accepts every name. A listed tool appears only from the source its calls go to.
+
+A source is shared by every request. Add it once, while the server is built, and read the caller
+inside `list` and `call`: sources cannot be removed, and on `layerHttp` a source added during a
+request would serve every later caller. A failed `list` fails the whole `tools/list`.
+
+The source runs inside its middleware, like a call: provide middleware to the effect that adds the
+source and pass `services: yield* Effect.context<never>()`. A visibility sees one `tools/list` with
+an empty `target` for the whole list, then one for each listed tool. A failed `list` fails the
+request with its code and message; `call` fails like an `addTool` handler. The server has no input
+schema for a sourced tool, so it does not validate arguments or `2026-07-28` parameter headers.
+
 ## Request-level dependencies
 
 Some services only exist per request, such as the user a request is made for. A tool declares them

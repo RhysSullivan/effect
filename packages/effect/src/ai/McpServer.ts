@@ -981,6 +981,67 @@ const isEnabled = (annotations: Context.Context<never>) => {
 
 const rejectedError = (rejected: McpCore.RequestRejected) => Effect.fail(rejected.error)
 
+// Maps the result of a tool handler, or a tool source's call, to a core outcome.
+const toolOutcome = (name: string, invocation: McpCore.McpInvocation) =>
+(
+  self: Effect.Effect<
+    CallToolResult | McpSchema.InputRequired,
+    InternalError | InvalidParams | McpCore.ToolNotFound | McpCore.RequestRejected
+  >
+): Effect.Effect<
+  McpCore.OperationOutcome<CallToolResult>,
+  | McpCore.ToolNotFound
+  | McpCore.InvalidToolInput
+  | McpCore.InvalidToolContinuation
+  | McpCore.ToolExecutionError
+  | McpCore.RequestRejected
+> =>
+  self.pipe(
+    Effect.catchTags({
+      InternalError: (error) => Effect.fail(new McpCore.ToolExecutionError({ name, message: error.message })),
+      InvalidParams: (error) =>
+        Effect.fail(
+          new (invocation.requestContext.requestState === undefined &&
+              invocation.requestContext.inputResponses === undefined
+            ? McpCore.InvalidToolInput
+            : McpCore.InvalidToolContinuation)({ name, message: error.message })
+        )
+    }),
+    Effect.map((result) =>
+      Predicate.isTagged(result, "InputRequired")
+        ? McpCore.OperationOutcome.InputRequired(result)
+        : McpCore.OperationOutcome.Complete(result)
+    )
+  )
+
+// Runs a tool source's list inside the full middleware stack, as a call runs.
+// A visibility that hides it leaves the source out of the list, and a failure
+// of the list fails the request with its code and message. The source's
+// services and middleware are taken from its context once, when it is added.
+const makeInvokeList = (
+  context: Context.Context<never> | undefined,
+  globalMiddleware: ReadonlyArray<AnyMiddlewareFn>
+) => {
+  const { localMiddleware, services } = context === undefined
+    ? { services: Context.empty(), localMiddleware: [] }
+    : prepareContext(context)
+  return <A>(
+    handler: Effect.Effect<ReadonlyArray<A>, InternalError, any>,
+    invocation: McpCore.McpInvocation
+  ): Effect.Effect<ReadonlyArray<A>, McpCore.RequestRejected> =>
+    runMiddleware(
+      services.mapUnsafe.size === 0
+        ? handler
+        : Effect.updateContext(handler, (current: Context.Context<any>) => Context.merge(services, current)),
+      middlewareStack(localMiddleware, globalMiddleware),
+      invocation,
+      { method: "tools/list", target: "", payload: undefined }
+    ).pipe(
+      catchHidden(() => Effect.succeed(Arr.empty<A>())),
+      Effect.catchTag("InternalError", rejectWith)
+    )
+}
+
 /**
  * Service that stores and serves an MCP server's registered tools, resources,
  * prompts, completions, and outgoing notifications.
@@ -1015,6 +1076,51 @@ export class McpServer extends Context.Service<McpServer, {
       InternalError | InvalidParams,
       McpRequestContext
     >
+  }) => Effect.Effect<void>
+  /**
+   * Adds tools that are known only per request, such as the tools of a remote
+   * MCP server reached as the caller.
+   *
+   * **Details**
+   *
+   * `list` runs on every `tools/list` and returns the source's complete list;
+   * the server does not page it. `call` runs for a `tools/call` whose name is
+   * not a tool added with `addTool` or a toolkit, when `owns` accepts the name.
+   * Without `owns` the source accepts every such name, so a source added after
+   * it receives none. A listed tool appears only where its calls go: not when a
+   * tool is registered under its name, and only from the first source whose
+   * `owns` accepts it.
+   *
+   * A source is shared by every request. Add it once, while the server is
+   * built, and read the caller inside `list` and `call`, never in the effect
+   * that adds it: sources cannot be removed, and on `layerHttp` a source added
+   * during a request would serve every later caller. A failed `list` fails the
+   * whole `tools/list`, registered tools included.
+   *
+   * Both run inside the middleware of `services` and the global middleware, as
+   * a call does. A visibility sees `tools/list` with an empty `target` once for
+   * the source's list, which it hides as a whole, then once for each listed
+   * tool, with that tool's name. A failure of `list` fails the `tools/list`
+   * request with its code and message. `call` fails like an `addTool` handler.
+   *
+   * The server has no input schema for a sourced tool before the call, so it
+   * neither validates the arguments nor checks the parameter headers of
+   * `2026-07-28` requests; `call` receives the arguments as sent.
+   *
+   * @since 4.1.7
+   */
+  readonly addToolSource: (options: {
+    readonly list: Effect.Effect<ReadonlyArray<McpTool>, InternalError, McpRequestContext>
+    readonly call: (
+      name: string,
+      payload: any
+    ) => Effect.Effect<
+      CallToolResult | McpSchema.InputRequired,
+      InternalError | InvalidParams,
+      McpRequestContext
+    >
+    readonly owns?: ((name: string) => boolean) | undefined
+    readonly services?: Context.Context<never> | undefined
   }) => Effect.Effect<void>
   readonly callTool: (
     requests: typeof CallTool.payloadSchema.Type
@@ -1264,32 +1370,35 @@ export class McpServer extends Context.Service<McpServer, {
               method: "tools/call",
               target: call.name,
               payload: call
-            }).pipe(
-              Effect.catchTags({
-                InternalError: (error) =>
-                  Effect.fail(
-                    new McpCore.ToolExecutionError({
-                      name: options.tool.name,
-                      message: error.message
-                    })
-                  ),
-                InvalidParams: (error) =>
-                  Effect.fail(
-                    new (invocation.requestContext.requestState === undefined &&
-                        invocation.requestContext.inputResponses === undefined
-                      ? McpCore.InvalidToolInput
-                      : McpCore.InvalidToolContinuation)({
-                      name: options.tool.name,
-                      message: error.message
-                    })
+            }).pipe(toolOutcome(options.tool.name, invocation))
+        })
+        yield* notifications.client["notifications/tools/list_changed"]({})
+      }),
+      addToolSource: Effect.fnUntraced(function*(options) {
+        const { invoke, visible } = makeInvoke(options.services, globalMiddleware)
+        const invokeList = makeInvokeList(options.services, globalMiddleware)
+        yield* internalCore.tools.registerSource({
+          owns: options.owns ?? (() => true),
+          list: (invocation) =>
+            invokeList(options.list, invocation).pipe(
+              Effect.flatMap((tools) =>
+                Effect.filter(tools, (tool) => visible("tools/list", tool.name)(invocation)).pipe(
+                  Effect.map((visibleTools) =>
+                    visibleTools.map((tool) =>
+                      tool.title === undefined && tool.annotations?.title !== undefined
+                        ? new McpTool({ ...tool, title: tool.annotations.title })
+                        : tool
+                    )
                   )
-              }),
-              Effect.map((result) =>
-                Predicate.isTagged(result, "InputRequired")
-                  ? McpCore.OperationOutcome.InputRequired(result)
-                  : McpCore.OperationOutcome.Complete(result)
+                )
               )
-            )
+            ),
+          handle: (call, invocation) =>
+            invoke(Effect.suspend(() => options.call(call.name, call.arguments)), invocation, {
+              method: "tools/call",
+              target: call.name,
+              payload: call
+            }).pipe(toolOutcome(call.name, invocation))
         })
         yield* notifications.client["notifications/tools/list_changed"]({})
       }),
