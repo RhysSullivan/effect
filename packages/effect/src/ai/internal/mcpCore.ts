@@ -176,8 +176,10 @@ export type ToolError =
  * @internal
  */
 export interface ToolRegistration {
+  readonly name: string
   // The canonical Tool copy normalizes its top-level title from
-  // `tool.title ?? tool.annotations?.title` at the public boundary.
+  // `tool.title ?? tool.annotations?.title` at the public boundary. It may be
+  // computed when first read, by a listing or a call of the tool.
   readonly descriptor: McpSchema.Tool
   readonly isVisible: (profile: NegotiatedProtocolProfile<string>) => boolean
   readonly visible?: Visible | undefined
@@ -567,7 +569,7 @@ export const make: Effect.Effect<McpCore> = Effect.sync(() => {
   const tools: Tools = {
     register: (registration) =>
       Effect.sync(() => {
-        registrations.set(registration.descriptor.name, registration)
+        registrations.set(registration.name, registration)
       }),
     list: (invocation) => filterList(registrations.values(), invocation),
     call: (call, invocation, beforeHandle) =>

@@ -114,6 +114,12 @@ const internalState = new WeakMap<object, {
   readonly core: McpCore.McpCore
   // Registers a skill's own file, skipping the check that reserves it for the skill.
   readonly addSkillFile: McpServer["Service"]["addResource"]
+  // Adds a tool whose descriptor is computed when first read.
+  readonly addDescribedTool: (
+    name: string,
+    describe: () => McpTool,
+    options: Omit<Parameters<McpServer["Service"]["addTool"]>[0], "tool">
+  ) => Effect.Effect<void>
   readonly notifications: Queue.Dequeue<QueuedServerNotification>
   readonly notificationDelivery: { consumers: number; listChangeRevision: number; requestEndpoints: number }
   readonly globalMiddleware: Array<middleware.Fn<any, any, any>>
@@ -1086,6 +1092,7 @@ export class McpServer extends Context.Service<McpServer, {
   static readonly make = Effect.gen(function*() {
     const internalCore = yield* McpCore.make
     const tools = Arr.empty<{
+      readonly name: string
       readonly tool: McpTool
       readonly annotations: Context.Context<never>
     }>()
@@ -1208,6 +1215,80 @@ export class McpServer extends Context.Service<McpServer, {
         })
         return notifications.client["notifications/resources/list_changed"]({})
       })
+    // A tool's descriptor is read by a listing, and by a call of the tool on
+    // 2026-07-28 to check its parameter headers. It is computed on first read
+    // and kept, so registering a tool does not describe it.
+    const addDescribedTool = (
+      name: string,
+      describe: () => McpTool,
+      options: Omit<Parameters<McpServer["Service"]["addTool"]>[0], "tool">
+    ): Effect.Effect<void> =>
+      Effect.suspend(() => {
+        let described: McpTool | undefined
+        let descriptor: McpTool | undefined
+        const getTool = () => described ??= describe()
+        const entry = {
+          name,
+          get tool() {
+            return getTool()
+          },
+          annotations: options.annotations,
+          services: options.services,
+          handle: options.handle
+        }
+        const existingIndex = tools.findIndex((existing) => existing.name === name)
+        if (existingIndex === -1) {
+          tools.push(entry)
+        } else {
+          tools[existingIndex] = entry
+        }
+        const { invoke, visible } = makeInvoke(options.services, globalMiddleware)
+        return internalCore.tools.register({
+          name,
+          get descriptor() {
+            if (descriptor === undefined) {
+              const tool = getTool()
+              descriptor = new McpTool({ ...tool, title: tool.title ?? tool.annotations?.title })
+            }
+            return descriptor
+          },
+          visible: visible("tools/list", name),
+          isVisible: isEnabled(options.annotations),
+          handle: (call, invocation, beforeHandle) =>
+            invoke(Effect.andThen(beforeHandle, () => options.handle(call.arguments)), invocation, {
+              method: "tools/call",
+              target: call.name,
+              payload: call
+            }).pipe(
+              Effect.catchTags({
+                InternalError: (error) =>
+                  Effect.fail(
+                    new McpCore.ToolExecutionError({
+                      name: name,
+                      message: error.message
+                    })
+                  ),
+                InvalidParams: (error) =>
+                  Effect.fail(
+                    new (invocation.requestContext.requestState === undefined &&
+                        invocation.requestContext.inputResponses === undefined
+                      ? McpCore.InvalidToolInput
+                      : McpCore.InvalidToolContinuation)({
+                      name: name,
+                      message: error.message
+                    })
+                  )
+              }),
+              Effect.map((result) =>
+                Predicate.isTagged(result, "InputRequired")
+                  ? McpCore.OperationOutcome.InputRequired(result)
+                  : McpCore.OperationOutcome.Complete(result)
+              )
+            )
+        }).pipe(
+          Effect.andThen(notifications.client["notifications/tools/list_changed"]({}))
+        )
+      })
     const service = McpServer.of({
       notifications: notifications.client,
       notifyElicitationComplete: ({ clientId, elicitationId }) =>
@@ -1227,55 +1308,7 @@ export class McpServer extends Context.Service<McpServer, {
       get tools() {
         return tools
       },
-      addTool: Effect.fnUntraced(function*(options) {
-        const existingIndex = tools.findIndex(({ tool }) => tool.name === options.tool.name)
-        if (existingIndex === -1) {
-          tools.push(options)
-        } else {
-          tools[existingIndex] = options
-        }
-        const { invoke, visible } = makeInvoke(options.services, globalMiddleware)
-        yield* internalCore.tools.register({
-          descriptor: new McpTool({
-            ...options.tool,
-            title: options.tool.title ?? options.tool.annotations?.title
-          }),
-          visible: visible("tools/list", options.tool.name),
-          isVisible: isEnabled(options.annotations),
-          handle: (call, invocation, beforeHandle) =>
-            invoke(Effect.andThen(beforeHandle, () => options.handle(call.arguments)), invocation, {
-              method: "tools/call",
-              target: call.name,
-              payload: call
-            }).pipe(
-              Effect.catchTags({
-                InternalError: (error) =>
-                  Effect.fail(
-                    new McpCore.ToolExecutionError({
-                      name: options.tool.name,
-                      message: error.message
-                    })
-                  ),
-                InvalidParams: (error) =>
-                  Effect.fail(
-                    new (invocation.requestContext.requestState === undefined &&
-                        invocation.requestContext.inputResponses === undefined
-                      ? McpCore.InvalidToolInput
-                      : McpCore.InvalidToolContinuation)({
-                      name: options.tool.name,
-                      message: error.message
-                    })
-                  )
-              }),
-              Effect.map((result) =>
-                Predicate.isTagged(result, "InputRequired")
-                  ? McpCore.OperationOutcome.InputRequired(result)
-                  : McpCore.OperationOutcome.Complete(result)
-              )
-            )
-        })
-        yield* notifications.client["notifications/tools/list_changed"]({})
-      }),
+      addTool: (options) => addDescribedTool(options.tool.name, () => options.tool, options),
       callTool: Effect.fnUntraced(function*(request) {
         const client = yield* McpServerClient
         const result = yield* internalCore.tools.call(
@@ -1462,6 +1495,7 @@ export class McpServer extends Context.Service<McpServer, {
     internalState.set(service, {
       core: internalCore,
       addSkillFile: (options) => addResource(options, false),
+      addDescribedTool,
       notifications: notificationsQueue,
       notificationDelivery,
       globalMiddleware
@@ -3320,7 +3354,9 @@ export const registerToolkit: <Tools extends Record<string, Tool.Any>, Names ext
         Effect.as(toolErrorResult(INTERNAL_TOOL_ERROR_MESSAGE))
       )
   }
-  const registrations: Array<Parameters<typeof registry.addTool>[0]> = []
+  const registrations: Array<
+    Omit<Parameters<typeof registry.addTool>[0], "tool"> & { readonly name: string; readonly describe: () => McpTool }
+  > = []
   for (const tool of Object.values(built.tools)) {
     const strict = Tool.getStrictMode(tool) === true
     const rawJsonSchema = Tool.isDynamic(tool) ? tool.jsonSchema : undefined
@@ -3335,11 +3371,18 @@ export const registerToolkit: <Tools extends Record<string, Tool.Any>, Names ext
     }
     const annotations = tool.annotations
     const toolMeta = Context.getOrUndefined(annotations, Tool.Meta)
-    const isDeclaredFailure = Schema.is(tool.failureSchema)
+    // The failure codecs are built on the first failure, as the Toolkit
+    // builds a tool's own codecs on its first call.
+    let isDeclaredFailure_: ((error: unknown) => boolean) | undefined
+    const isDeclaredFailure = (error: unknown) => (isDeclaredFailure_ ??= Schema.is(tool.failureSchema))(error)
     // MCP content is JSON. Failures raised in "error" mode skip the Toolkit's encoding, so they use the JSON codec here.
-    const encodeFailureJson = Schema.encodeUnknownEffect(Schema.toCodecJson(tool.failureSchema)) as (
-      value: unknown
-    ) => Effect.Effect<unknown, Schema.SchemaError, Tool.HandlerServices<Tools[keyof Tools]>>
+    let encodeFailureJson_:
+      | ((value: unknown) => Effect.Effect<unknown, Schema.SchemaError, Tool.HandlerServices<Tools[keyof Tools]>>)
+      | undefined
+    const encodeFailureJson = (value: unknown) =>
+      (encodeFailureJson_ ??= Schema.encodeUnknownEffect(Schema.toCodecJson(tool.failureSchema)) as (
+        value: unknown
+      ) => Effect.Effect<unknown, Schema.SchemaError, Tool.HandlerServices<Tools[keyof Tools]>>)(value)
     const encodeFailure = (toolResult: unknown) =>
       Effect.mapError(encodeFailureJson(toolResult), (cause) =>
         AiError.make({
@@ -3379,41 +3422,68 @@ export const registerToolkit: <Tools extends Record<string, Tool.Any>, Names ext
     }
     const content = options?.content
     const mapper = content && Object.hasOwn(content, tool.name) ? content[tool.name as Names] : undefined
-    const outputSchema = mapper ? undefined : yield* Schema.decodeUnknownEffect(McpSchema.ToolOutputJson)(
-      toolJsonSchema(tool.successSchema, false)
-    ).pipe(Effect.orDie)
-    const inputSchema = yield* Schema.decodeUnknownEffect(ToolJson)(
-      rawJsonSchema ?? toolJsonSchema(tool.parametersSchema, strict)
-    ).pipe(
-      Effect.catchTag("SchemaError", (error) =>
-        Effect.die(
+    // An input JSON Schema that is not an object is refused when the toolkit
+    // is registered. The schemas are computed then only when the parameters
+    // may not encode to an object; otherwise, with the rest of the descriptor,
+    // when a listing or a call first reads it.
+    // A schema the JSON Schema generator cannot describe fails naming the tool,
+    // whether it is described at registration or when first read.
+    const describeSchema = (schema: Schema.Constraint, strict: boolean): JsonSchema.JsonSchema => {
+      try {
+        return toolJsonSchema(schema, strict)
+      } catch (cause) {
+        throw new Error(
+          `McpServer cannot describe tool '${tool.name}': ${cause instanceof Error ? cause.message : String(cause)}`,
+          { cause }
+        )
+      }
+    }
+    const inputJsonSchema = (): Result.Result<McpSchema.ToolJson, string> =>
+      Result.mapError(
+        decodeToolJson(rawJsonSchema ?? describeSchema(tool.parametersSchema, strict)),
+        (error) =>
           rawJsonSchema !== undefined
             ? `McpServer cannot register tool '${tool.name}': its raw JSON Schema must have an object root ` +
               `(type: "object").\n\n${error.message}`
             : `McpServer cannot register tool '${tool.name}': its parameters must encode to a JSON Schema with an ` +
               `object root (type: "object"), such as a Schema.Struct. Use Tool.EmptyParams for a tool without ` +
               `parameters.\n\n${error.message}`
-        ))
-    )
-    const mcpTool = new McpTool({
-      name: tool.name,
-      description: Tool.getDescription(tool),
-      inputSchema,
-      outputSchema,
-      annotations: {
-        ...(Context.getOption(tool.annotations, Tool.Title).pipe(
-          Option.map((title) => ({ title })),
-          Option.getOrUndefined
-        )),
-        readOnlyHint: Context.get(tool.annotations, Tool.Readonly),
-        destructiveHint: Context.get(tool.annotations, Tool.Destructive),
-        idempotentHint: Context.get(tool.annotations, Tool.Idempotent),
-        openWorldHint: Context.get(tool.annotations, Tool.OpenWorld)
-      },
-      _meta: toolMeta
-    })
+      )
+    let inputSchema: McpSchema.ToolJson | undefined
+    if (rawJsonSchema !== undefined || !encodesToObject(tool.parametersSchema)) {
+      const checked = inputJsonSchema()
+      if (Result.isFailure(checked)) {
+        return yield* Effect.die(checked.failure)
+      }
+      inputSchema = checked.success
+    }
+    const describe = () => {
+      if (inputSchema === undefined) {
+        const checked = inputJsonSchema()
+        if (Result.isFailure(checked)) throw new Error(checked.failure)
+        inputSchema = checked.success
+      }
+      return new McpTool({
+        name: tool.name,
+        description: Tool.getDescription(tool),
+        inputSchema,
+        outputSchema: mapper ? undefined : decodeToolOutputJson(describeSchema(tool.successSchema, false)),
+        annotations: {
+          ...(Context.getOption(tool.annotations, Tool.Title).pipe(
+            Option.map((title) => ({ title })),
+            Option.getOrUndefined
+          )),
+          readOnlyHint: Context.get(tool.annotations, Tool.Readonly),
+          destructiveHint: Context.get(tool.annotations, Tool.Destructive),
+          idempotentHint: Context.get(tool.annotations, Tool.Idempotent),
+          openWorldHint: Context.get(tool.annotations, Tool.OpenWorld)
+        },
+        _meta: toolMeta
+      })
+    }
     registrations.push({
-      tool: mcpTool,
+      name: tool.name,
+      describe,
       annotations,
       handle(payload) {
         return built.handle(tool.name as keyof Tools, payload ?? {}, undefined, decodeOptions).pipe(
@@ -3456,8 +3526,14 @@ export const registerToolkit: <Tools extends Record<string, Tool.Any>, Names ext
       services
     })
   }
+  // A server made by this module describes each tool when it is first read.
+  // Another implementation of the service, such as one that wraps it, receives
+  // the described tool through `addTool`.
+  const addDescribedTool = internalState.get(registry)?.addDescribedTool
   for (const registration of registrations) {
-    yield* registry.addTool(registration)
+    yield* addDescribedTool === undefined
+      ? Effect.suspend(() => registry.addTool({ ...registration, tool: registration.describe() }))
+      : addDescribedTool(registration.name, registration.describe, registration)
   }
 })
 
@@ -3481,6 +3557,24 @@ const toolJsonSchema = (schema: Schema.Constraint, strict: boolean): JsonSchema.
     ? document.schema
     : { ...document.schema, $defs: document.definitions }
 }
+
+// Whether a schema certainly encodes to a JSON Schema with an object root:
+// its encoded form is a struct or record of string keys, with no checks that
+// could add to the root. Anything else is described when it is registered.
+const encodesToObject = (schema: Schema.Constraint): boolean => {
+  const ast = SchemaAST.getLastEncoding(schema.ast)
+  return SchemaAST.isObjects(ast) &&
+    ast.checks === undefined &&
+    ast.encodingChecks === undefined &&
+    (ast.propertySignatures.length > 0 || ast.indexSignatures.length > 0) &&
+    ast.propertySignatures.every((property) => typeof property.name === "string")
+}
+
+const decodeToolJson = (input: unknown): Result.Result<McpSchema.ToolJson, Schema.SchemaError> =>
+  Schema.decodeUnknownResult(ToolJson)(input)
+
+const decodeToolOutputJson = (input: unknown): McpSchema.ToolOutputJson =>
+  Schema.decodeUnknownSync(McpSchema.ToolOutputJson)(input)
 
 /**
  * Creates a layer that registers a `Toolkit` with the `McpServer`.
