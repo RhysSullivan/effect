@@ -1641,6 +1641,40 @@ export class McpServer extends Context.Service<McpServer, {
   static readonly layer: Layer.Layer<McpServer> = Layer.effect(McpServer)(McpServer.make)
 }
 
+/**
+ * Wraps an MCP server service, replacing some of its members, such as
+ * `addToolSource`, so that code given the wrapper goes through them.
+ *
+ * **Details**
+ *
+ * The wrapper is the server itself for everything this module does with a
+ * server it made: global middleware, skills, events, a transport and a
+ * toolkit's tools, which it still describes when they are first listed. A
+ * service built by hand, with a spread of the server, is none of those: this
+ * module does not know it, and describes a toolkit's tools at once. Members
+ * not replaced are the server's own, getters included. A toolkit registered
+ * through the wrapper is registered with the server's own registration, not
+ * through a replaced `addTool`.
+ *
+ * @stability unstable
+ * @category constructors
+ * @since 4.1.7
+ */
+export const wrap = (
+  server: McpServer["Service"],
+  members: Partial<McpServer["Service"]>
+): McpServer["Service"] => {
+  const wrapped: McpServer["Service"] = Object.create(
+    server,
+    Object.fromEntries(
+      Object.entries(members).map(([name, value]) => [name, { value, enumerable: true }])
+    )
+  )
+  const state = internalState.get(server)
+  if (state !== undefined) internalState.set(wrapped, state)
+  return wrapped
+}
+
 const MCP_SESSION_ID_HEADER = "mcp-session-id"
 const MCP_PROTOCOL_VERSION_HEADER = "mcp-protocol-version"
 const MCP_INVALID_BATCH_METHOD = "invalid/json-rpc-batch"
