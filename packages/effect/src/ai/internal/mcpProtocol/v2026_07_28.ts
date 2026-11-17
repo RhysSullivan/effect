@@ -382,6 +382,18 @@ export const makeHandlers = (
     const hint = context.serverInfo.cacheHints?.[family]
     return hint === undefined ? privateStaleCache : { ttlMs: hint.ttlMs, cacheScope: hint.cacheScope }
   }
+  // The server's own `cacheHints.tools`, if set, is a contributor too, and
+  // always private. Without any hint the list stays private and stale.
+  const toolsCacheHint = (listed: McpCore.ToolListResult) => {
+    const own = context.serverInfo.cacheHints?.tools
+    const ttls = [own?.ttlMs, listed.ttlMs].filter((ttl): ttl is number => ttl !== undefined)
+    return {
+      ttlMs: ttls.length === 0 ? 0 : Math.min(...ttls),
+      cacheScope: own === undefined && !listed.registered && listed.cacheScope === "public"
+        ? "public" as const
+        : "private" as const
+    }
+  }
   const getDiscovery = Effect.map(context.registrationPresence, (presence) => {
     const capabilities: Types.Mutable<typeof McpSchema.ServerCapabilities.Type> = { completions: {}, logging: {} }
     const declared = McpSkills.declareExtension(extensions, presence.skills)
@@ -663,10 +675,11 @@ export const makeHandlers = (
     ) {
       yield* McpProtocol.rejectCursor(request.cursor)
       const invocation = yield* getInvocation
-      const tools = yield* core.tools.list(invocation)
-      const projectedTools = yield* Effect.forEach(tools, projectTool)
+      const listed = yield* core.tools.listResult(invocation)
+      const projectedTools = yield* Effect.forEach(listed.tools, projectTool)
       const result = yield* projectCompleteResult({
-        ...cacheHint("tools"),
+        ...toolsCacheHint(listed),
+        ...(listed._meta === undefined ? {} : { _meta: listed._meta }),
         tools: projectedTools
       }, context.serverInfo)
       return yield* decodeListToolsResult(result)

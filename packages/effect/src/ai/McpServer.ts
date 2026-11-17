@@ -1025,10 +1025,10 @@ const makeInvokeList = (
   const { localMiddleware, services } = context === undefined
     ? { services: Context.empty(), localMiddleware: [] }
     : prepareContext(context)
-  return <A>(
-    handler: Effect.Effect<ReadonlyArray<A>, InternalError, any>,
+  return (
+    handler: Effect.Effect<McpCore.ToolSourceListing, InternalError, any>,
     invocation: McpCore.McpInvocation
-  ): Effect.Effect<ReadonlyArray<A>, McpCore.RequestRejected> =>
+  ): Effect.Effect<McpCore.ToolSourceListing, McpCore.RequestRejected> =>
     runMiddleware(
       services.mapUnsafe.size === 0
         ? handler
@@ -1037,9 +1037,25 @@ const makeInvokeList = (
       invocation,
       { method: "tools/list", target: "", payload: undefined }
     ).pipe(
-      catchHidden(() => Effect.succeed(Arr.empty<A>())),
+      catchHidden(() => Effect.succeed<McpCore.ToolSourceListing>({ tools: [] })),
       Effect.catchTag("InternalError", rejectWith)
     )
+}
+
+/**
+ * What a tool source's `list` may return beside its tools: how long they stay
+ * fresh, in milliseconds, whether a cache shared between users may keep them,
+ * and metadata for the `tools/list` result. See `addToolSource`.
+ *
+ * @stability unstable
+ * @category models
+ * @since 4.1.7
+ */
+export interface ToolSourceList {
+  readonly tools: ReadonlyArray<McpTool>
+  readonly ttlMs?: number | undefined
+  readonly cacheScope?: "public" | "private" | undefined
+  readonly _meta?: Readonly<Record<string, unknown>> | undefined
 }
 
 /**
@@ -1107,10 +1123,19 @@ export class McpServer extends Context.Service<McpServer, {
    * neither validates the arguments nor checks the parameter headers of
    * `2026-07-28` requests; `call` receives the arguments as sent.
    *
+   * `list` may return a {@link ToolSourceList} instead of the tools alone, to
+   * say how long its tools stay fresh and whether a shared cache may keep
+   * them, and to add result metadata. On `2026-07-28` the `tools/list` result
+   * then carries the smallest `ttlMs` its sources and the server's own
+   * `cacheHints.tools` give, `"public"` only when no registered tool is listed,
+   * the server sets no `cacheHints.tools`, and every source says `"public"`,
+   * and each source's `_meta` keys, the first source's value winning. Earlier
+   * protocol revisions have no such fields and list the tools alone.
+   *
    * @since 4.1.7
    */
   readonly addToolSource: (options: {
-    readonly list: Effect.Effect<ReadonlyArray<McpTool>, InternalError, McpRequestContext>
+    readonly list: Effect.Effect<ReadonlyArray<McpTool> | ToolSourceList, InternalError, McpRequestContext>
     readonly call: (
       name: string,
       payload: any
@@ -1380,17 +1405,23 @@ export class McpServer extends Context.Service<McpServer, {
         yield* internalCore.tools.registerSource({
           owns: options.owns ?? (() => true),
           list: (invocation) =>
-            invokeList(options.list, invocation).pipe(
-              Effect.flatMap((tools) =>
-                Effect.filter(tools, (tool) => visible("tools/list", tool.name)(invocation)).pipe(
-                  Effect.map((visibleTools) =>
-                    visibleTools.map((tool) =>
-                      tool.title === undefined && tool.annotations?.title !== undefined
-                        ? new McpTool({ ...tool, title: tool.annotations.title })
-                        : tool
-                    )
+            invokeList(
+              Effect.map(options.list, (listed): McpCore.ToolSourceListing =>
+                "tools" in listed ? listed : { tools: listed }),
+              invocation
+            ).pipe(
+              Effect.flatMap((listing) =>
+                Effect.filter(listing.tools, (tool) =>
+                  visible("tools/list", tool.name)(invocation)).pipe(
+                    Effect.map((visibleTools) => ({
+                      ...listing,
+                      tools: visibleTools.map((tool) =>
+                        tool.title === undefined && tool.annotations?.title !== undefined
+                          ? new McpTool({ ...tool, title: tool.annotations.title })
+                          : tool
+                      )
+                    }))
                   )
-                )
               )
             ),
           handle: (call, invocation) =>

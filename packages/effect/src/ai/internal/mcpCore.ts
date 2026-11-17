@@ -194,6 +194,33 @@ export interface ToolRegistration {
 }
 
 /**
+ * One source's tools, with how long they stay fresh, whether a shared cache
+ * may keep them, and metadata for the list result.
+ *
+ * @internal
+ */
+export interface ToolSourceListing {
+  readonly tools: ReadonlyArray<McpSchema.Tool>
+  readonly ttlMs?: number | undefined
+  readonly cacheScope?: "public" | "private" | undefined
+  readonly _meta?: Readonly<Record<string, unknown>> | undefined
+}
+
+/**
+ * A `tools/list` with what its sources said about it. `sourced` is whether any
+ * source contributed; `registered` whether any registered tool is listed.
+ *
+ * @internal
+ */
+export interface ToolListResult {
+  readonly tools: ReadonlyArray<McpSchema.Tool>
+  readonly registered: boolean
+  readonly ttlMs?: number | undefined
+  readonly cacheScope?: "public" | "private" | undefined
+  readonly _meta?: Readonly<Record<string, unknown>> | undefined
+}
+
+/**
  * Tools that are known only per request: `list` is asked on every
  * `tools/list`, and calls of names no registration has reach `handle` when
  * `owns` accepts them.
@@ -202,7 +229,7 @@ export interface ToolRegistration {
  */
 export interface ToolSourceRegistration {
   readonly owns: (name: string) => boolean
-  readonly list: (invocation: McpInvocation) => Effect.Effect<ReadonlyArray<McpSchema.Tool>, RequestRejected>
+  readonly list: (invocation: McpInvocation) => Effect.Effect<ToolSourceListing, RequestRejected>
   readonly handle: (
     call: typeof McpSchema.CallTool.payloadSchema.Type,
     invocation: McpInvocation
@@ -224,6 +251,8 @@ export interface Tools {
   readonly list: (
     invocation: McpInvocation
   ) => Effect.Effect<ReadonlyArray<McpSchema.Tool>, RequestRejected>
+  /** `list`, with the sources' freshness, cache scope and metadata. */
+  readonly listResult: (invocation: McpInvocation) => Effect.Effect<ToolListResult, RequestRejected>
   readonly call: (
     call: typeof McpSchema.CallTool.payloadSchema.Type,
     invocation: McpInvocation,
@@ -586,6 +615,58 @@ export const make: Effect.Effect<McpCore> = Effect.sync(() => {
       (entries) => entries.map((entry) => entry.descriptor)
     )
 
+  const listResult = (invocation: McpInvocation): Effect.Effect<ToolListResult, RequestRejected> =>
+    toolSources.length === 0
+      ? Effect.map(filterList(registrations.values(), invocation), (tools) => ({
+        tools,
+        registered: tools.length > 0
+      }))
+      : Effect.map(
+        Effect.all([
+          filterList(registrations.values(), invocation),
+          Effect.forEach(toolSources, (source) => source.list(invocation), { concurrency: "unbounded" })
+        ], { concurrency: "unbounded" }),
+        ([registered, sourced]): ToolListResult => {
+          // A sourced tool is listed only where its calls go: not when a
+          // tool is registered under its name, and only from the first
+          // source whose `owns` accepts the name.
+          const tools = Array.from(registered)
+          const seen = new Set<string>()
+          // The smallest freshness any source gives; public only when every
+          // source says so; each `_meta` key from the first source that sets it.
+          let ttlMs: number | undefined
+          let everyPublic = true
+          let anyScope = false
+          const meta: Record<string, unknown> = {}
+          sourced.forEach((listing, index) => {
+            const source = toolSources[index]
+            for (const tool of listing.tools) {
+              if (registrations.has(tool.name) || seen.has(tool.name)) continue
+              if (toolSources.find((candidate) => candidate.owns(tool.name)) !== source) continue
+              seen.add(tool.name)
+              tools.push(tool)
+            }
+            if (listing.ttlMs !== undefined) {
+              ttlMs = ttlMs === undefined
+                ? listing.ttlMs
+                : Math.min(ttlMs, listing.ttlMs)
+            }
+            if (listing.cacheScope !== undefined) anyScope = true
+            if (listing.cacheScope !== "public") everyPublic = false
+            for (const [key, value] of Object.entries(listing._meta ?? {})) {
+              if (!Object.hasOwn(meta, key)) meta[key] = value
+            }
+          })
+          return {
+            tools,
+            registered: registered.length > 0,
+            ...(ttlMs === undefined ? {} : { ttlMs }),
+            ...(anyScope ? { cacheScope: everyPublic ? "public" : "private" } : {}),
+            ...(Object.keys(meta).length === 0 ? {} : { _meta: meta })
+          }
+        }
+      )
+
   const tools: Tools = {
     register: (registration) =>
       Effect.sync(() => {
@@ -595,32 +676,8 @@ export const make: Effect.Effect<McpCore> = Effect.sync(() => {
       Effect.sync(() => {
         toolSources.push(source)
       }),
-    list: (invocation) =>
-      toolSources.length === 0
-        ? filterList(registrations.values(), invocation)
-        : Effect.map(
-          Effect.all([
-            filterList(registrations.values(), invocation),
-            Effect.forEach(toolSources, (source) => source.list(invocation), { concurrency: "unbounded" })
-          ], { concurrency: "unbounded" }),
-          ([registered, sourced]) => {
-            // A sourced tool is listed only where its calls go: not when a
-            // tool is registered under its name, and only from the first
-            // source whose `owns` accepts the name.
-            const tools = Array.from(registered)
-            const seen = new Set<string>()
-            sourced.forEach((listed, index) => {
-              const source = toolSources[index]
-              for (const tool of listed) {
-                if (registrations.has(tool.name) || seen.has(tool.name)) continue
-                if (toolSources.find((candidate) => candidate.owns(tool.name)) !== source) continue
-                seen.add(tool.name)
-                tools.push(tool)
-              }
-            })
-            return tools
-          }
-        ),
+    list: (invocation) => Effect.map(listResult(invocation), (result) => result.tools),
+    listResult,
     call: (call, invocation, beforeHandle) =>
       Effect.suspend((): Effect.Effect<OperationOutcome<McpSchema.CallToolResult>, ToolError> => {
         const registration = registrations.get(call.name)
