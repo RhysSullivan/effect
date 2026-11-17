@@ -117,6 +117,8 @@ const internalState = new WeakMap<object, {
   readonly core: McpCore.McpCore
   // Registers a skill's own file, skipping the check that reserves it for the skill.
   readonly addSkillFile: McpServer["Service"]["addResource"]
+  // Applied to every tool the server lists, whatever registered it (`wrap`'s `listed`).
+  readonly listedTools: { transform: ((tool: McpTool) => McpTool) | undefined }
   readonly notifications: Queue.Dequeue<QueuedServerNotification>
   readonly notificationDelivery: { consumers: number; listChangeRevision: number; requestEndpoints: number }
   readonly globalMiddleware: Array<middleware.Fn<any, any, any>>
@@ -1356,6 +1358,8 @@ export class McpServer extends Context.Service<McpServer, {
         })
         return notifications.client["notifications/resources/list_changed"]({})
       })
+    const listedTools: { transform: ((tool: McpTool) => McpTool) | undefined } = { transform: undefined }
+    const listed = (tool: McpTool) => listedTools.transform === undefined ? tool : listedTools.transform(tool)
     const service = McpServer.of({
       notifications: notifications.client,
       notifyElicitationComplete: ({ clientId, elicitationId }) =>
@@ -1376,6 +1380,7 @@ export class McpServer extends Context.Service<McpServer, {
         return tools
       },
       addTool: Effect.fnUntraced(function*(options) {
+        const tool = listed(options.tool)
         const existingIndex = tools.findIndex(({ tool }) => tool.name === options.tool.name)
         if (existingIndex === -1) {
           tools.push(options)
@@ -1385,8 +1390,8 @@ export class McpServer extends Context.Service<McpServer, {
         const { invoke, visible } = makeInvoke(options.services, globalMiddleware)
         yield* internalCore.tools.register({
           descriptor: new McpTool({
-            ...options.tool,
-            title: options.tool.title ?? options.tool.annotations?.title
+            ...tool,
+            title: tool.title ?? tool.annotations?.title
           }),
           visible: visible("tools/list", options.tool.name),
           isVisible: isEnabled(options.annotations),
@@ -1415,11 +1420,12 @@ export class McpServer extends Context.Service<McpServer, {
                   visible("tools/list", tool.name)(invocation)).pipe(
                     Effect.map((visibleTools) => ({
                       ...listing,
-                      tools: visibleTools.map((tool) =>
-                        tool.title === undefined && tool.annotations?.title !== undefined
+                      tools: visibleTools.map((source) => {
+                        const tool = listed(source)
+                        return tool.title === undefined && tool.annotations?.title !== undefined
                           ? new McpTool({ ...tool, title: tool.annotations.title })
                           : tool
-                      )
+                      })
                     }))
                   )
               )
@@ -1619,6 +1625,7 @@ export class McpServer extends Context.Service<McpServer, {
     internalState.set(service, {
       core: internalCore,
       addSkillFile: (options) => addResource(options, false),
+      listedTools,
       notifications: notificationsQueue,
       notificationDelivery,
       globalMiddleware
@@ -1662,7 +1669,17 @@ export class McpServer extends Context.Service<McpServer, {
  */
 export const wrap = (
   server: McpServer["Service"],
-  members: Partial<McpServer["Service"]>
+  members: Partial<McpServer["Service"]>,
+  options?: {
+    /**
+     * Applied to every tool the server lists from then on, whatever
+     * registered it: `addTool`, a toolkit or a tool source, through the
+     * wrapper or not. It receives the object that was registered or listed,
+     * before the server copies a title from its annotations, so it can tell
+     * tools apart by identity. A second `listed` runs after the first.
+     */
+    readonly listed?: ((tool: McpTool) => McpTool) | undefined
+  }
 ): McpServer["Service"] => {
   const wrapped: McpServer["Service"] = Object.create(
     server,
@@ -1671,7 +1688,14 @@ export const wrap = (
     )
   )
   const state = internalState.get(server)
-  if (state !== undefined) internalState.set(wrapped, state)
+  if (state !== undefined) {
+    internalState.set(wrapped, state)
+    const added = options?.listed
+    if (added !== undefined) {
+      const before = state.listedTools.transform
+      state.listedTools.transform = before === undefined ? added : (tool) => added(before(tool))
+    }
+  }
   return wrapped
 }
 

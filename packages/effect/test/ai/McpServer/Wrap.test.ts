@@ -4,6 +4,7 @@ import * as McpSchema from "effect/ai/McpSchema"
 import * as McpServer from "effect/ai/McpServer"
 import * as Tool from "effect/ai/Tool"
 import * as Toolkit from "effect/ai/Toolkit"
+import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Schema from "effect/Schema"
@@ -71,4 +72,48 @@ describe("McpServer.wrap", () => {
     assert.strictEqual(wrapped.tools, server.tools)
     assert.strictEqual(wrapped.addTool, server.addTool)
   })
+})
+
+describe("McpServer.wrap listed", () => {
+  const key = "test/confirmed"
+  const vouched = new WeakSet<McpSchema.Tool>()
+  const claimed = (name: string) =>
+    new McpSchema.Tool({ name, inputSchema: { type: "object" }, _meta: { [key]: true } })
+  const kept = claimed("Kept")
+  vouched.add(kept)
+  const Toolkits = Toolkit.make(
+    Tool.make("FromToolkit", { success: Schema.String }).annotate(Tool.Meta, { [key]: true })
+  )
+  const stripping = Layer.effect(
+    McpServer.McpServer,
+    Effect.map(McpServer.McpServer, (server) =>
+      McpServer.wrap(server, {}, {
+        listed: (tool) => {
+          if (vouched.has(tool) || tool._meta === undefined || !(key in tool._meta)) return tool
+          const { [key]: _dropped, ...rest } = tool._meta
+          return new McpSchema.Tool({ ...tool, _meta: rest })
+        }
+      }))
+  )
+  const handle = () => Effect.succeed(new McpSchema.CallToolResult({ content: [] }))
+  const app = Layer.mergeAll(
+    Layer.effectDiscard(Effect.gen(function*() {
+      const server = yield* McpServer.McpServer
+      yield* server.addTool({ tool: kept, annotations: Context.empty(), handle })
+      yield* server.addTool({ tool: claimed("Added"), annotations: Context.empty(), handle })
+      yield* server.addToolSource({ list: Effect.succeed([claimed("Sourced")]), call: handle })
+    })),
+    McpServer.toolkit(Toolkits).pipe(Layer.provide(Toolkits.toLayer({ FromToolkit: () => Effect.succeed("ok") })))
+  ).pipe(Layer.provide(stripping))
+
+  it.effect("applies to every tool the server lists, whatever registered it", () =>
+    Effect.gen(function*() {
+      const harness = yield* makeMcpStdioHarness(McpProtocol.v2025_11_25, [McpProtocol.v2025_11_25], app)
+      yield* harness.initialize()
+      const listed = yield* harness.sendRequest("tools/list")
+      const tools = (listed.result as { tools: ReadonlyArray<{ name: string; _meta?: Record<string, unknown> }> })
+        .tools
+      const marked = Object.fromEntries(tools.map((tool) => [tool.name, tool._meta?.[key] === true]))
+      assert.deepStrictEqual(marked, { Kept: true, Added: false, FromToolkit: false, Sourced: false })
+    }))
 })
