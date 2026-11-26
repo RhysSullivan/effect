@@ -686,7 +686,8 @@ export const makeHandlers = (
             (error) =>
               Effect.succeed(McpCore.OperationOutcome.Complete(PublicMcpSchema.CallToolResult.make({
                 content: [PublicMcpSchema.TextContent.make({ type: "text", text: error.message })],
-                isError: true
+                isError: true,
+                ...(error._tag === "InvalidToolInput" ? { _meta: { [PublicMcpSchema.InvalidInputMeta]: true } } : {})
               })))
           )
         )

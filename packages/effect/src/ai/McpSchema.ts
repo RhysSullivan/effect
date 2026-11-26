@@ -689,6 +689,26 @@ export const METHOD_NOT_FOUND_ERROR_CODE = -32601 as const
  */
 export const INVALID_PARAMS_ERROR_CODE = -32602 as const
 /**
+ * The `_meta` key under which a tool error result says that the tool refused
+ * its input.
+ *
+ * **Details**
+ *
+ * From `2025-11-25`, a tool call whose arguments are invalid is answered with a
+ * tool error (`isError: true`) whose text is the message, as a tool that failed
+ * while running is, so that a model can correct its input. The server sets this
+ * key to `true` on the first kind only: arguments that do not decode, and a
+ * handler or tool source that fails with `InvalidParams`. A client can then
+ * tell a refused input from a failure without reading the text. Earlier
+ * revisions send a refused input as the JSON-RPC error `-32602` instead.
+ *
+ * @stability unstable
+ * @category constants
+ * @since 4.1.7
+ */
+export const InvalidInputMeta = "website.effect/invalidInput"
+
+/**
  * Represents the JSON-RPC error code for internal server errors.
  *
  * **When to use**

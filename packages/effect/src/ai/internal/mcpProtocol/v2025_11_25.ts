@@ -324,7 +324,8 @@ export const protocol = McpProtocol.make({
                 type: "text",
                 text: error.message
               })],
-              isError: true
+              isError: true,
+              ...(error._tag === "InvalidToolInput" ? { _meta: { [PublicMcpSchema.InvalidInputMeta]: true } } : {})
             }))),
           Effect.mapError(McpProtocol.ProtocolError.fromTool)
         )
